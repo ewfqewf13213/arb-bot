@@ -18,7 +18,7 @@ from aiogram.types import Message
 
 # ---------------- НАСТРОЙКИ ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-EXCHANGES = ["binance", "bybit", "okx", "kucoin", "gate", "mexc"]
+EXCHANGES = ["okx", "kucoin", "gate", "mexc", "bitget", "htx"]
 QUOTE = "USDT"
 TAKER_FEE = 0.001          # 0.1% за сделку (поменяй под свой тариф)
 SCAN_INTERVAL = 10         # секунд между сканами
