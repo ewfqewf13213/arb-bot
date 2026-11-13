@@ -4,10 +4,14 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: arb-screener
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,5 +22,10 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          MIN_CROSS: "1.0"
+          COINGECKO_KEY: ${{ secrets.COINGECKO_KEY }}
+          LOOPS: "4"
+          INTERVAL: "60"
+          MIN_CHAIN: "1.0"
           MIN_TRI: "0.3"
+          CHAIN_TRADE_USD: "1000"
+          TRADE_USD: "300"
