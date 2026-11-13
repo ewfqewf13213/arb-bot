@@ -25,7 +25,7 @@ jobs:
           COINGECKO_KEY: ${{ secrets.COINGECKO_KEY }}
           LOOPS: "4"
           INTERVAL: "60"
-          MIN_CHAIN: "1.0"
-          MIN_TRI: "0.3"
+          MIN_CHAIN: "-3"
+          MIN_TRI: "-0.5"
           CHAIN_TRADE_USD: "1000"
           TRADE_USD: "300"
