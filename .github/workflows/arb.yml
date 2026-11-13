@@ -17,6 +17,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: |
+            state-
       - run: pip install ccxt aiogram
       - run: python arb_once.py
         env:
@@ -25,7 +31,8 @@ jobs:
           COINGECKO_KEY: ${{ secrets.COINGECKO_KEY }}
           LOOPS: "4"
           INTERVAL: "60"
-          MIN_CHAIN: "-3"
-          MIN_TRI: "-0.5"
+          REPEAT_MIN: "30"
+          MIN_CHAIN: "1.0"
+          MIN_TRI: "0.3"
           CHAIN_TRADE_USD: "1000"
           TRADE_USD: "300"
