@@ -1,12 +1,19 @@
-"""Скринер для GitHub Actions v3: межбиржевой (с сетями) + треугольный, 2 отдельных сообщения."""
+"""Скринер v4 для GitHub Actions:
+  1) межсетевой арбитраж: один токен в разных блокчейнах (DEX, данные DexScreener + CoinGecko)
+  2) треугольный арбитраж на биржах
+Каждый запуск сканирует рынок LOOPS раз с паузой INTERVAL секунд (по умолчанию 4 раза по 60 с).
+Два отдельных сообщения в Telegram.
+"""
 import asyncio
+import html
 import json
 import os
+import time
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 
-import ccxt.async_support as ccxt
 import arb_screener as a
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -17,21 +24,49 @@ def env_f(name, default):
     return float(os.getenv(name) or default)
 
 
-MIN_CROSS = env_f("MIN_CROSS", 1.0)    # мин. чистая прибыль (после всех комиссий), %
-MAX_CROSS = env_f("MAX_CROSS", 8.0)    # выше — считаем мусором
+# ---------- настройки ----------
+LOOPS = int(env_f("LOOPS", 4))
+INTERVAL = env_f("INTERVAL", 60)
+REPEAT_MIN = env_f("REPEAT_MIN", 0)          # не повторять тот же сигнал N минут (0 = всегда слать)
+
+# межсетевой
+MIN_CHAIN = env_f("MIN_CHAIN", 1.0)          # мин. чистая прибыль, %
+MAX_CHAIN = env_f("MAX_CHAIN", 15.0)         # выше — считаем мусором
+CHAIN_USD = env_f("CHAIN_TRADE_USD", 1000)   # сумма сделки для расчёта
+MIN_LIQ = env_f("MIN_LIQUIDITY", 150000)     # мин. ликвидность пула, $
+MIN_DEX_VOL = env_f("MIN_DEX_VOLUME", 50000) # мин. объём пула за 24ч, $
+MIN_AGE_DAYS = env_f("MIN_AGE_DAYS", 7)      # мин. возраст пула, дней
+DEX_FEE = env_f("DEX_FEE", 0.3) / 100        # комиссия DEX за своп
+BRIDGE_USD = env_f("BRIDGE_USD", 2.0)        # ориентир комиссии моста, $
+CG_KEY = os.getenv("COINGECKO_KEY", "")      # необязательный бесплатный ключ CoinGecko
+
+# треугольный
 MIN_TRI = env_f("MIN_TRI", 0.3)
 MAX_TRI = env_f("MAX_TRI", 3.0)
-TRADE_USD = env_f("TRADE_USD", 300)    # сумма, на которую считаем стакан
-MIN_VOL = env_f("MIN_VOLUME", 500000)  # мин. суточный объём пары, $
+TRADE_USD = env_f("TRADE_USD", 300)
+MIN_VOL = env_f("MIN_VOLUME", 500000)
 FEE = a.TAKER_FEE
 Q = a.QUOTE
 
+# CoinGecko platform id -> (DexScreener chainId, название, ориентир газа на 1 своп, $)
+CHAINS = {
+    "ethereum": ("ethereum", "Ethereum", 8.0),
+    "binance-smart-chain": ("bsc", "BSC", 0.3),
+    "solana": ("solana", "Solana", 0.05),
+    "arbitrum-one": ("arbitrum", "Arbitrum", 0.4),
+    "base": ("base", "Base", 0.15),
+    "polygon-pos": ("polygon", "Polygon", 0.1),
+    "optimistic-ethereum": ("optimism", "Optimism", 0.3),
+    "avalanche": ("avalanche", "Avalanche", 0.3),
+}
+GAS = {v[0]: v[2] for v in CHAINS.values()}
+CNAME = {v[0]: v[1] for v in CHAINS.values()}
 NAMES = {"binance": "Binance", "bybit": "Bybit", "okx": "OKX",
          "kucoin": "KuCoin", "gate": "Gate.io", "mexc": "MEXC"}
 nm = lambda e: NAMES.get(e, e.capitalize())
 
 
-# ---------- форматирование ----------
+# ---------- утилиты ----------
 def fp(x):
     if x >= 1:
         return f"{x:,.4f}".rstrip("0").rstrip(".")
@@ -55,9 +90,43 @@ def send(text):
     urllib.request.urlopen(req, timeout=20)
 
 
+def http_json(url, headers=None, tries=3, wait=15):
+    h = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    if headers:
+        h.update(headers)
+    for k in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=30) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and k < tries - 1:
+                time.sleep(wait * (k + 1))
+                continue
+            print("HTTP", e.code, url[:90])
+            return None
+        except Exception as e:
+            if k < tries - 1:
+                time.sleep(3)
+                continue
+            print("ERR", str(e)[:80], url[:60])
+            return None
+
+
+sent_at = {}
+
+
+def fresh(key):
+    if REPEAT_MIN <= 0:
+        return True
+    t = time.time()
+    if t - sent_at.get(key, 0) < REPEAT_MIN * 60:
+        return False
+    sent_at[key] = t
+    return True
+
+
 # ---------- стакан ----------
 def walk_buy(asks, quote_amt):
-    """Тратим quote_amt по стакану, возвращаем купленное количество."""
     spent = qty = 0.0
     for lvl in asks:
         p, q = lvl[0], lvl[1]
@@ -70,7 +139,6 @@ def walk_buy(asks, quote_amt):
 
 
 def walk_sell(bids, base_qty):
-    """Продаём base_qty по стакану, возвращаем полученную сумму."""
     got = sold = 0.0
     for lvl in bids:
         p, q = lvl[0], lvl[1]
@@ -82,142 +150,136 @@ def walk_sell(bids, base_qty):
     return got if sold >= base_qty * 0.999 and got > 0 else None
 
 
-# ---------- биржи ----------
-async def load_exchanges():
+# ================= МЕЖСЕТЕВОЙ (DEX) =================
+def norm(chain, addr):
+    return addr if chain == "solana" else addr.lower()
+
+
+def build_chain_map():
+    """Токены из топа по объёму, которые есть минимум в двух поддерживаемых сетях."""
+    hdr = {"x-cg-demo-api-key": CG_KEY} if CG_KEY else None
+    base = "https://api.coingecko.com/api/v3"
+    lst = http_json(f"{base}/coins/list?include_platform=true", hdr)
+    if not isinstance(lst, list):
+        return None
+    top = set()
+    for page in (1, 2):
+        m = http_json(f"{base}/coins/markets?vs_currency=usd&order=volume_desc"
+                      f"&per_page=250&page={page}", hdr)
+        if isinstance(m, list):
+            top |= {c["id"] for c in m}
+    if not top:
+        return None
     out = {}
-    for name in a.EXCHANGES:
-        cfg = {"enableRateLimit": True}
-        k = os.getenv(f"{name.upper()}_API_KEY")
-        s = os.getenv(f"{name.upper()}_API_SECRET")
-        p = os.getenv(f"{name.upper()}_API_PASSWORD")
-        if k and s:
-            cfg["apiKey"], cfg["secret"] = k, s
-        if p:
-            cfg["password"] = p
-        ex = None
-        try:
-            ex = getattr(ccxt, name)(cfg)
-            await ex.load_markets()
-            out[name] = ex
-        except Exception as e:
-            print(f"[{name}] не загрузилась: {str(e)[:100]}")
-            if ex:
-                await ex.close()
+    for c in lst:
+        if c.get("id") not in top:
+            continue
+        pl = {}
+        for cg, addr in (c.get("platforms") or {}).items():
+            if cg in CHAINS and addr:
+                ch = CHAINS[cg][0]
+                pl[ch] = norm(ch, addr)
+        if len(pl) >= 2:
+            out[c["id"]] = {"sym": (c.get("symbol") or "").upper(), "chains": pl}
+    print(f"токенов в 2+ сетях: {len(out)}")
     return out
 
 
-async def load_currencies(exs):
-    async def one(n, e):
-        try:
-            return n, await asyncio.wait_for(e.fetch_currencies(), 40)
-        except Exception as ex:
-            print(f"[{n}] currencies: {str(ex)[:80]}")
-            return n, None
-    res = dict(await asyncio.gather(*(one(n, e) for n, e in exs.items())))
-    print("данные по сетям:", {n: bool(v) for n, v in res.items()})
-    return res
-
-
-def net_info(cur, bx, sx, base):
-    """Выбор сети для перевода bx -> sx. status: ok | blocked | unknown."""
-    cb = (cur.get(bx) or {}).get(base)
-    cs = (cur.get(sx) or {}).get(base)
-    if not cb or not cs:
-        return {"status": "unknown", "fee": None, "network": None}
-    if cb.get("active") is False or cs.get("active") is False:
-        return {"status": "blocked"}
-    nb, ns = cb.get("networks") or {}, cs.get("networks") or {}
-    if nb and ns:
-        common = [n for n in nb if n in ns]
-        if not common:
-            return {"status": "unknown", "fee": None, "network": None}
-        good = [n for n in common
-                if nb[n].get("withdraw") is not False and ns[n].get("deposit") is not False]
-        if not good:
-            return {"status": "blocked"}
-        best = min(good, key=lambda n: (nb[n].get("fee") is None, nb[n].get("fee") or 0))
-        return {"status": "ok", "fee": nb[best].get("fee"), "network": best}
-    if cb.get("withdraw") is False or cs.get("deposit") is False:
-        return {"status": "blocked"}
-    return {"status": "ok", "fee": cb.get("fee"), "network": None}
-
-
-# ---------- межбиржевой ----------
-def cross_candidates(all_t):
-    by = defaultdict(dict)
-    for ex, tk in all_t.items():
-        for sym, t in tk.items():
-            if not sym.endswith(f"/{Q}") or not t.get("bid") or not t.get("ask"):
+def pick_pools(responses, lookup):
+    """Лучший (по ликвидности) пул токена в каждой сети с учётом фильтров."""
+    best = {}
+    now_ms = time.time() * 1000
+    for d in responses:
+        pairs = d if isinstance(d, list) else ((d or {}).get("pairs") or [])
+        for p in pairs:
+            try:
+                ch = p["chainId"]
+                cid = lookup.get((ch, norm(ch, p["baseToken"]["address"])))
+                if not cid:
+                    continue
+                price = float(p["priceUsd"])
+                liq = float((p.get("liquidity") or {}).get("usd") or 0)
+                vol = float((p.get("volume") or {}).get("h24") or 0)
+                created = p.get("pairCreatedAt")
+                if price <= 0 or liq < MIN_LIQ or vol < MIN_DEX_VOL:
+                    continue
+                if created and (now_ms - created) / 86400000 < MIN_AGE_DAYS:
+                    continue
+                cur = best.get((cid, ch))
+                if not cur or liq > cur["liq"]:
+                    best[(cid, ch)] = dict(price=price, liq=liq, vol=vol, chain=ch,
+                                           dex=p.get("dexId", ""), url=p.get("url", ""))
+            except Exception:
                 continue
-            if (t.get("quoteVolume") or 0) < MIN_VOL:
-                continue
-            by[sym][ex] = t
+    return best
+
+
+def chain_net(buy, sell):
+    T = CHAIN_USD
+    slip_b = min(T / (buy["liq"] / 2), 1.0)
+    slip_s = min(T / (sell["liq"] / 2), 1.0)
+    tokens = T * (1 - DEX_FEE) / (buy["price"] * (1 + slip_b))
+    proceeds = tokens * sell["price"] * (1 - slip_s) * (1 - DEX_FEE)
+    gas = GAS.get(buy["chain"], 1.0) + GAS.get(sell["chain"], 1.0)
+    profit = proceeds - T - gas - BRIDGE_USD
+    return dict(profit=profit, pct=profit / T * 100, gas=gas,
+                slip=(slip_b + slip_s) * 100, fees=2 * DEX_FEE * 100)
+
+
+def find_chain_signals(best, cmap):
+    by = defaultdict(list)
+    for (cid, _), v in best.items():
+        by[cid].append(v)
     out = []
-    for sym, per in by.items():
-        if len(per) < 2:
+    for cid, items in by.items():
+        if len(items) < 2:
             continue
-        bx = min(per, key=lambda e: per[e]["ask"])
-        sx = max(per, key=lambda e: per[e]["bid"])
-        if bx == sx:
+        buy = min(items, key=lambda x: x["price"])
+        sell = max(items, key=lambda x: x["price"])
+        spread = (sell["price"] / buy["price"] - 1) * 100
+        if spread <= 0 or spread > MAX_CHAIN + 3:
             continue
-        net = (per[sx]["bid"] / per[bx]["ask"] - 1) * 100 - 2 * FEE * 100
-        if MIN_CROSS <= net <= MAX_CROSS:
-            out.append((net, sym, bx, sx, per[bx]["quoteVolume"], per[sx]["quoteVolume"]))
-    out.sort(reverse=True)
-    return out[:15]
+        n = chain_net(buy, sell)
+        if MIN_CHAIN <= n["pct"] <= MAX_CHAIN:
+            out.append(dict(cid=cid, sym=cmap[cid]["sym"], buy=buy, sell=sell,
+                            spread=spread, **n))
+    out.sort(key=lambda r: -r["pct"])
+    return out
 
 
-async def check_cross(exs, cur, cand):
-    net0, sym, bx, sx, vb, vs = cand
-    base = sym.split("/")[0]
-    try:
-        ob_b, ob_s = await asyncio.gather(
-            exs[bx].fetch_order_book(sym, 20), exs[sx].fetch_order_book(sym, 20))
-    except Exception:
-        return None
-    qty = walk_buy(ob_b["asks"], TRADE_USD)
-    if qty is None:
-        return None
-    buy_avg = TRADE_USD / qty
-    info = net_info(cur, bx, sx, base)
-    if info["status"] == "blocked":
-        return None
-    wfee = info.get("fee") or 0.0
-    qty_sell = qty * (1 - FEE) - wfee
-    if qty_sell <= 0:
-        return None
-    got = walk_sell(ob_s["bids"], qty_sell)
-    if got is None:
-        return None
-    proceeds = got * (1 - FEE)
-    profit = proceeds - TRADE_USD
-    pct = profit / TRADE_USD * 100
-    if not (MIN_CROSS <= pct <= MAX_CROSS):
-        return None
-    sell_avg = got / qty_sell
-    return dict(sym=sym, base=base, bx=bx, sx=sx, buy=buy_avg, sell=sell_avg,
-                spread=(sell_avg / buy_avg - 1) * 100, pct=pct, profit=profit,
-                vb=vb, vs=vs, info=info, wfee=wfee, wfee_usd=wfee * buy_avg)
+async def scan_chains(cmap, sem):
+    lookup = {(ch, ad): cid for cid, v in cmap.items() for ch, ad in v["chains"].items()}
+    addrs = sorted({ad for (_, ad) in lookup})
+    chunks = [addrs[i:i + 30] for i in range(0, len(addrs), 30)]
+
+    async def one(chunk):
+        async with sem:
+            d = await asyncio.to_thread(
+                http_json, "https://api.dexscreener.com/latest/dex/tokens/" + ",".join(chunk),
+                None, 2, 10)
+            await asyncio.sleep(0.2)
+            return d
+
+    res = await asyncio.gather(*(one(c) for c in chunks))
+    return find_chain_signals(pick_pools(res, lookup), cmap)
 
 
-def cross_block(r):
-    i = r["info"]
-    L = [f"🪙 <b>{r['sym']}</b>  ·  <b>+{r['pct']:.2f}%</b>  (≈ +${r['profit']:.2f})",
-         f"🟢 Купить: <b>{nm(r['bx'])}</b> по {fp(r['buy'])}",
-         f"🔴 Продать: <b>{nm(r['sx'])}</b> по {fp(r['sell'])}",
-         f"📊 Спред по стакану: {r['spread']:.2f}%",
-         f"📦 Объём 24ч: {fv(r['vb'])} ({nm(r['bx'])}) · {fv(r['vs'])} ({nm(r['sx'])})"]
-    if i["status"] == "ok":
-        fee_txt = (f"комиссия вывода {fp(r['wfee'])} {r['base']} (≈ ${r['wfee_usd']:.2f})"
-                   if i.get("fee") is not None else "комиссия вывода неизвестна")
-        L.append(f"🌐 Сеть: <b>{i['network'] or 'не указана'}</b> · {fee_txt}")
-        L.append(f"✅ Вывод с {nm(r['bx'])} · ✅ Ввод на {nm(r['sx'])} открыты")
-    else:
-        L.append("⚠️ Сети, комиссия и статус ввода/вывода: нет данных — проверь вручную")
-    return "\n".join(L)
+def chain_block(r):
+    b, s = r["buy"], r["sell"]
+    link = lambda p, t: f'<a href="{html.escape(p["url"])}">{t}</a>' if p["url"] else t
+    return "\n".join([
+        f"🪙 <b>{html.escape(r['sym'])}</b>  ·  <b>+{r['pct']:.2f}%</b>  (≈ +${r['profit']:.0f} на ${CHAIN_USD:.0f})",
+        f"🟢 Купить: <b>{CNAME.get(b['chain'], b['chain'])}</b> · ${fp(b['price'])}",
+        f"     {html.escape(b['dex'])} · ликвидность {fv(b['liq'])} · {link(b, 'пул')}",
+        f"🔴 Продать: <b>{CNAME.get(s['chain'], s['chain'])}</b> · ${fp(s['price'])}",
+        f"     {html.escape(s['dex'])} · ликвидность {fv(s['liq'])} · {link(s, 'пул')}",
+        f"📊 Разница цен: {r['spread']:.2f}%",
+        f"🧾 Издержки (оценка): DEX {r['fees']:.1f}% · проскальзывание ~{r['slip']:.1f}% · "
+        f"газ ≈ ${r['gas']:.1f} · мост ≈ ${BRIDGE_USD:.0f}",
+    ])
 
 
-# ---------- треугольный ----------
+# ================= ТРЕУГОЛЬНЫЙ =================
 def tri_candidates(ex_name, tickers, triangles):
     out = []
     mult = (1 - FEE) ** 3
@@ -270,10 +332,8 @@ async def check_tri(exs, cand, sem):
 
 
 def tri_block(r):
-    path = [Q]
-    lines = []
-    nums = ["1️⃣", "2️⃣", "3️⃣"]
-    for n, (sym, side, price) in zip(nums, r["legs"]):
+    path, lines = [Q], []
+    for n, (sym, side, price) in zip(["1️⃣", "2️⃣", "3️⃣"], r["legs"]):
         b, q = sym.split("/")
         if side == "buy":
             lines.append(f"{n} Купить <b>{b}</b> за {q}  ({sym} @ {fp(price)})")
@@ -287,37 +347,59 @@ def tri_block(r):
         f"💰 ${TRADE_USD:.0f} → <b>${r['end']:.2f}</b>  (после 3 комиссий по {FEE*100:.2f}%)"])
 
 
-# ---------- main ----------
-async def main():
-    exs = await load_exchanges()
+# ================= main =================
+async def scan_once(exs, triangles, cmap, sem):
     now = datetime.now(timezone.utc).strftime("%H:%M")
+
+    if cmap:
+        try:
+            sigs = [r for r in await scan_chains(cmap, sem)
+                    if fresh(f"c:{r['cid']}:{r['buy']['chain']}:{r['sell']['chain']}")][:5]
+            if sigs:
+                head = (f"🌉 <b>МЕЖСЕТЕВОЙ АРБИТРАЖ (DEX)</b>\n🕒 {now} UTC · расчёт на ${CHAIN_USD:.0f}\n"
+                        f"Прибыль — оценка после комиссий DEX, проскальзывания, газа и моста\n")
+                foot = ("\n\nℹ️ Газ и мост — ориентиры, проверь реальные цифры. "
+                        "Перевод занимает минуты, цена может уйти.")
+                send(head + "\n" + "\n\n".join(chain_block(r) for r in sigs) + foot)
+            print("межсетевых:", len(sigs))
+        except Exception as e:
+            print("chain error:", e)
+
     try:
         all_t = await a.fetch_all_tickers(exs)
-        cur = await load_currencies(exs)
-
-        # межбиржевой
-        res = await asyncio.gather(*(check_cross(exs, cur, c) for c in cross_candidates(all_t)))
-        cross = sorted([r for r in res if r], key=lambda r: -r["pct"])[:5]
-        if cross:
-            head = (f"🔀 <b>МЕЖБИРЖЕВОЙ СПРЕД</b>\n🕒 {now} UTC · расчёт на ${TRADE_USD:.0f}\n"
-                    f"Прибыль указана после комиссий торговли и вывода\n")
-            foot = "\n\nℹ️ Цены меняются быстро — перед сделкой перепроверь стакан и сеть."
-            send(head + "\n" + "\n\n".join(cross_block(r) for r in cross) + foot)
-
-        # треугольный
         cands = []
         for name, tk in all_t.items():
-            cands += tri_candidates(name, tk, a.build_triangles(exs[name].markets))
-        sem = asyncio.Semaphore(4)
-        tres = await asyncio.gather(*(check_tri(exs, c, sem) for c in cands))
-        tri = sorted([r for r in tres if r], key=lambda r: -r["pct"])[:4]
+            cands += tri_candidates(name, tk, triangles[name])
+        res = await asyncio.gather(*(check_tri(exs, c, sem) for c in cands))
+        tri = sorted([r for r in res if r and fresh(f"t:{r['ex']}:{r['legs'][0][0]}:{r['legs'][1][0]}:{r['legs'][2][0]}")],
+                     key=lambda r: -r["pct"])[:4]
         if tri:
             head = (f"🔺 <b>ТРЕУГОЛЬНЫЙ АРБИТРАЖ</b>\n🕒 {now} UTC · расчёт на ${TRADE_USD:.0f}\n"
                     f"Стакан проверен по всем трём ногам\n")
             foot = "\n\nℹ️ Такие окна живут секунды — это радар, а не гарантия."
             send(head + "\n" + "\n\n".join(tri_block(r) for r in tri) + foot)
+        print("треугольных:", len(tri))
+    except Exception as e:
+        print("tri error:", e)
 
-        print(f"межбиржевых: {len(cross)}, треугольных: {len(tri)}")
+
+async def main():
+    exs = await a.load_exchanges()
+    triangles = {n: a.build_triangles(e.markets) for n, e in exs.items()}
+    cmap = await asyncio.to_thread(build_chain_map)
+    if not cmap:
+        try:
+            send("⚠️ Межсетевой: CoinGecko не ответил (лимит запросов). "
+                 "Треугольный работает. Добавь бесплатный ключ COINGECKO_KEY в Secrets.")
+        except Exception:
+            pass
+    sem = asyncio.Semaphore(4)
+    try:
+        for i in range(LOOPS):
+            t0 = time.time()
+            await scan_once(exs, triangles, cmap, sem)
+            if i < LOOPS - 1:
+                await asyncio.sleep(max(1.0, INTERVAL - (time.time() - t0)))
     finally:
         for e in exs.values():
             await e.close()
